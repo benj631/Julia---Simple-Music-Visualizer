@@ -26,7 +26,6 @@ Various tutorials for Julia were helpful, but I focused on:
 [From zero to Julia!](https://techytok.com/from-zero-to-julia/)
 The language came across as pretty similar to python, and did not seem as difficult to use as I was anticipating.
 
-- [OpenCV C++ Install, Build, Run using VS Code and CMake (Debug and Release)](https://youtu.be/CnXUTG9XYGI)
 - ChatGPT was very useful for the project, but I did have to understand what the code was doing in order to do this.
 
 # Future Work
