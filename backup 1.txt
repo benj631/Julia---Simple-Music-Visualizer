@@ -1,0 +1,152 @@
+println(" \n \n === Julia Music Visualizer ===")
+println("Step 1: Checking for WAV file...")
+
+ffmpeg_path = raw"C:\Program Files\FFmpeg\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe"
+mp3_path = raw"D:\Documents\_Ben Docs\School\2025 Spring\CSE310\Module 3 - Julia\Julia Proj\Birocratic - the long retreat.mp3"
+wav_path = raw"D:\Documents\_Ben Docs\School\2025 Spring\CSE310\Module 3 - Julia\Julia Proj\output.wav"
+
+if isfile(wav_path)
+    println("WAV file already exists — skipping conversion.")
+else
+    println("WAV file not found — converting MP3 to WAV...")
+    run(`$ffmpeg_path -y -i $mp3_path -ac 1 -ar 44100 $wav_path`)
+    println("MP3 converted to WAV.")
+end
+
+println("Loading Wav into memory...")
+
+using Statistics
+using WAV, DSP, FFTW, GLMakie, GeometryBasics, Printf
+
+
+# Load audio
+y, fs = wavread(wav_path)
+y = y[:,1]  # Mono
+
+println(" \n \n Loaded WAV: $(length(y)) samples at $fs Hz.")
+
+# Preprocess parameters
+frame_size = 1024
+hop_size = Int(round(fs / 60))  # Hop so we store ~60 frames per second
+win = hanning(frame_size)
+
+n_bands = 20
+fft_len = div(frame_size, 2)
+band_edges = floor.(Int, range(1, fft_len, length=n_bands+1))
+
+# Preprocess loop — store band frames
+println("Preprocessing WAV... storing band frames at 60 FPS...")
+band_frames = []
+
+
+for i in 1:hop_size:length(y)-frame_size
+    frame = y[i:i+frame_size-1] .* win
+    fft_result = abs.(fft(frame)[1:fft_len])
+
+    base = 1.15  # Adjust this base > 1; higher = more boost to highs
+    correction = [base^(j-1) for j in 1:n_bands]
+
+    band_values = [mean(fft_result[band_edges[j]:band_edges[j+1]-1]) for j in 1:n_bands]
+
+    # Apply correction:
+    band_values .*= correction
+
+    push!(band_frames, band_values)
+end
+
+println("Stored $(length(band_frames)) frames (~$(length(band_frames)/60) seconds at 60 FPS)")
+
+# Visualization setup
+println("Preparing visualization...")
+
+fig = Figure(size = (800, 400), backgroundcolor = :black)
+
+ax = Axis(fig[1,1];
+    backgroundcolor = :black,
+    xgridvisible = false,
+    ygridvisible = false,
+    xticks = ([1, n_bands], ["Bass", "Treble"]),
+    leftspinevisible = false
+)
+
+bar_heights = Observable(zeros(n_bands))
+bars_plot = barplot!(ax, 1:n_bands, bar_heights; color=:deepskyblue)
+
+
+peak_values = zeros(n_bands)
+peak_decay = 0.85
+
+positions_obs = Observable([Point{2, Float64}(0.0, j) for j in 1:n_bands])
+scatter_plot = scatter!(ax, positions_obs; markersize=10, color=:orange)
+display(fig)
+
+# Launch AIMP
+AIMP_path = raw"C:\Program Files\AIMP\AIMP.exe"
+println("Launching AIMP...")
+proc = run(`$AIMP_path $mp3_path`, wait=false)
+
+# Wait for AIMP to start
+sleep(1.5)
+
+# Playback loop — exactly 60 FPS
+println("Starting visualization playback at 60 FPS...")
+fps_sleep = 1 / 60
+total_time_sec = length(band_frames) / 60
+progress_length = 40  # length of the progress bar in characters
+
+# ESC key handling
+esc_pressed = Ref(false)
+
+on(events(fig).keyboardbutton) do event
+    if event.action == Keyboard.press && event.key == Keyboard.escape
+        println("\nESC pressed — exiting...")
+        esc_pressed[] = true   # CORRECT way to set Ref
+    end
+end
+
+# Playback loop — exactly 60 FPS
+println("Starting visualization playback at 60 FPS...")
+fps_sleep = 1 / 60
+total_time_sec = length(band_frames) / 60
+progress_length = 40  # length of the progress bar in characters
+
+let frame_counter = 0
+    for frame_values in band_frames
+        frame_counter += 1
+
+        # Progress bar
+        progress_ratio = frame_counter / length(band_frames)
+        filled_length = round(Int, progress_ratio * progress_length)
+        bar = "[" * repeat("=", filled_length) * repeat(" ", progress_length - filled_length) * "]"
+
+        current_time_sec = frame_counter / 60
+
+        print("\r", bar, "  ", @sprintf("%.1f / %.1f sec", current_time_sec, total_time_sec))
+        flush(stdout)
+
+        # Update bar heights
+        bar_heights[] = frame_values
+
+        # Update peak hold values
+        for j in 1:n_bands
+            peak_values[j] = max(peak_values[j], frame_values[j])
+            peak_values[j] *= peak_decay
+        end
+
+        # Update scatter
+        positions_obs[] = [Point{2, Float64}(j, peak_values[j]) for j in 1:n_bands]
+
+        # ESC check
+        if esc_pressed[]    # CORRECT way to read Ref
+            println("\nESC detected — terminating early...")
+            break
+        end
+
+        sleep(fps_sleep)
+    end
+end
+
+# After loop, print newline so prompt is clean
+println()
+println("Closing AIMP...")
+run(`taskkill /IM AIMP.exe /F`)

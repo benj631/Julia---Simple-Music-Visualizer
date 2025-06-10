@@ -1,0 +1,350 @@
+println("\n=== Julia Music Visualizer ===")
+println("\nChecking for WAV file...")
+
+using Statistics
+using Dates
+using WAV, DSP, FFTW, GLMakie, GeometryBasics, Printf
+
+using Colors
+lerp(a, b, t) = a * (1 - t) + b * t
+
+ffmpeg_path = raw"C:\Program Files\FFmpeg\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe"
+mp3_path = raw"D:\Documents\_Ben Docs\School\2025 Spring\CSE310\Module 3 - Julia - Music Visualizer\Julia - Music Visualizer\Birocratic - the long retreat.mp3"
+wav_path = raw"D:\Documents\_Ben Docs\School\2025 Spring\CSE310\Module 3 - Julia - Music Visualizer\Julia - Music Visualizer\output.wav"
+
+if isfile(wav_path)
+    println("\nWAV file already exists — skipping conversion.")
+else
+    println("\nWAV file not found — converting MP3 to WAV...")
+    run(`$ffmpeg_path -y -i $mp3_path -ac 1 -ar 44100 $wav_path`) # Use FFmpeg to get wav from mp3.
+    println("\nMP3 converted to WAV.")
+end
+
+println("\nLoading Wav into memory...")
+
+# Load audio
+y, fs = wavread(wav_path)
+y = y[:,1]  # Mono
+
+println("\nLoaded WAV: $(length(y)) samples at $fs Hz.")
+
+# Preprocess parameters
+frame_size = 2048
+hop_size = Int(round(fs / 60))
+win = hanning(frame_size) # Smooth ends of buffer
+
+n_bands = 20 # Number of bars
+fft_len = div(frame_size, 2)
+
+
+# Compute log-scaled band edges (Not using)
+function log_spaced_band_edges(n_bands, fft_len, fs)
+    f_min = 25.0 # Min hz
+    f_max = 15000 # Max hz
+    log_edges = exp.(range(log(f_min), log(f_max), length = n_bands + 1))
+    bin_edges = clamp.(round.(Int, log_edges / (fs / fft_len)), 2, fft_len)
+    return bin_edges
+end
+
+function hybrid_band_edges(n_bands, fft_len, fs, linear_bands=6)
+    bin_hz = fs / fft_len
+    f_min = 25.0
+    f_max = 15000
+    
+    linear_bins = round.(Int, range(2, Int(round(300 / bin_hz)), length=linear_bands+1))
+    
+    log_edges = exp.(range(log(300.0), log(f_max), length=n_bands - linear_bands + 1))
+    log_bins = clamp.(round.(Int, log_edges / bin_hz), linear_bins[end]+1, fft_len)
+    
+    return vcat(linear_bins[1:end-1], log_bins)
+end
+
+
+band_edges = hybrid_band_edges(n_bands, fft_len, fs)
+
+println("\nPreprocessing WAV... storing band frames at 60 FPS...")
+band_frames = []         # stores raw values → used for blue bars
+smoothed_frames = []     # stores smoothed values → used for teal rectangles
+smoothed_frame = zeros(n_bands)
+smoothing_alpha = 0.5    # feel free to tune this (0.5-0.7 is typical)
+
+for i in 1:hop_size:length(y)-frame_size
+    frame = y[i:i+frame_size-1] .* win
+    fft_result = abs.(fft(frame)[1:fft_len])
+    fft_result[1] = 0  # Zero out DC
+
+    # Apply exponential correction
+    exp_factor = 1.8
+    base = 1.1
+
+    correction = [(j / n_bands)^exp_factor * base^(j-1) for j in 1:n_bands]
+    correction ./= maximum(correction)
+
+    # Correct linear bands
+    boost_linear_bands = 3   # first 4 bands
+    boost_factor = 10.0       # linear multiplier
+
+    for j in 1:boost_linear_bands
+        correction[j] *= boost_factor
+    end
+
+    # Normalize correction
+    correction ./= maximum(correction)
+
+    # Compute band values safely
+    band_values = [
+        isempty(fft_result[band_edges[j]:band_edges[j+1]-1]) ? 0.0 :
+        mean(fft_result[band_edges[j]:band_edges[j+1]-1])
+        for j in 1:n_bands
+    ]
+    band_values .*= correction
+
+    # Raw frame → for bars
+    raw_frame = band_values
+
+    # Smoothed frame → for peaks
+    smoothed_frame .= smoothing_alpha .* band_values .+ (1 - smoothing_alpha) .* smoothed_frame
+
+    # Push both frames
+    push!(band_frames, copy(raw_frame))
+    push!(smoothed_frames, copy(smoothed_frame))
+end
+
+println("\nStored $(length(band_frames)) frames (~$(@sprintf("%.2f", length(band_frames)/60)) seconds at 60 FPS)")
+
+# Visualization setup
+println("\nPreparing visualization...")
+
+fig = Figure(size = (800, 400), backgroundcolor = :black)
+ax = Axis(fig[1, 1];
+    backgroundcolor = :black,
+    xgridvisible = false,
+    ygridvisible = false,
+    xticks = ([1, n_bands], ["Bass", "Treble"]),
+    leftspinevisible = false
+)
+
+fig[1, 1] = ax
+rowsize!(fig.layout, 1, Fixed(300))  # lock row height to 300 pixels
+
+# Fix View window auto sizing.
+
+# Attempt to fit things in the view window
+scale_factor = 1/3
+max_value = maximum(vcat(band_frames...))
+y_max_display = max_value * scale_factor
+ylims!(ax, 0, y_max_display * 1.1)
+
+bar_heights = Observable(zeros(n_bands))
+bars_plot = barplot!(ax, 1:n_bands, bar_heights; color=RGBA(0.255, 0.411, 0.882, 1)) # Royal Blue
+
+# peak_values = zeros(n_bands)
+peak_values = fill(0.05, n_bands)   # small initial height
+peak_decay = 0.95 # Fall speed of bars
+
+# Small rectangles at top of bars
+rect_width = 0.8
+rect_height = 0.1
+rect_obs = Observable([
+    Rect(j - rect_width/2, peak_values[j] - rect_height/2, rect_width, rect_height)
+    for j in 1:n_bands
+])
+rect_plot = poly!(ax, rect_obs; color = :teal)
+
+display(fig)
+
+# Launch AIMP
+AIMP_path = raw"C:\Program Files\AIMP\AIMP.exe"
+println("Launching AIMP...")
+proc = run(`$AIMP_path $mp3_path`, wait=false)
+sleep(1.525)
+
+# Playback loop — 60 FPS
+println("Starting visualization playback at 60 FPS...")
+fps_sleep = 1 / 60
+total_time_sec = length(y) / fs 
+progress_length = 40
+
+esc_pressed = Ref(false)
+on(events(fig).keyboardbutton) do event
+    if event.action == Keyboard.press && event.key == Keyboard.escape
+        println("\nESC pressed — exiting...")
+        esc_pressed[] = true
+    end
+end
+
+target_fps = 60
+ghost_duration_sec = 1.3
+ghost_fps = target_fps
+ghost_frames_count = Int(round(ghost_duration_sec * target_fps))  # 60–90 is great
+
+# History buffer
+ghost_history = Vector{Vector{Float64}}(undef, 0)
+
+# Initialize ghost bars Observable
+ghost_bar_heights = [Observable(zeros(n_bands)) for i in 1:ghost_frames_count]
+
+ghost_bar_plots = [
+    barplot!(ax, 1:n_bands, ghost_bar_heights[i];
+        color=RGBA(0.0, 0.75, 1.0, 0.0),
+        overdraw = true)
+    for i in 1:ghost_frames_count
+]
+
+ghost_alphas = [0.8 * (1 - (i / ghost_frames_count)^0.4) for i in 1:ghost_frames_count]
+ghost_colors = [RGB(
+    lerp(0.5, 1.0, i / ghost_frames_count),
+    lerp(0.0, 0.5, i / ghost_frames_count),
+    lerp(0.5, 0.0, i / ghost_frames_count)
+) for i in 1:ghost_frames_count]
+
+bar_display_values = fill(0.0, n_bands)  # tracks the bar height with smoothing
+bar_decay = 0.9  # adjust → 0.9 = medium slow fall, 0.95 = very slow
+
+target_fps = 60
+frame_interval_sec = 1 / target_fps
+
+let
+    start_time = time()
+    last_frame_idx = -1
+    elapsed_sec = 0.0
+    jitter = 0.1
+
+    # Dual timer variables
+    frame_times_per_second = Float64[]
+    frame_time_window_sec = 1.0
+    max_frame_count_in_window = Int(round(frame_time_window_sec * target_fps))
+
+    progress_length = 50
+    progress_chars = fill(' ', progress_length)
+
+    last_print_time = time()
+
+    last_fps_print_time = 0.0
+    fps_print_interval = 1.0
+
+    last_main_update_time = 0.0
+    last_ghost_update_time = 0.0
+
+    main_update_interval = 1 / 60
+    ghost_update_interval = 1 / 20
+
+    while !esc_pressed[] && elapsed_sec < total_time_sec + 1.0
+        loop_start_time = time()
+        elapsed_sec = time() - start_time
+        current_time = elapsed_sec
+        desired_frame_idx = clamp(floor(Int, current_time * target_fps) + 1, 1, length(band_frames))
+
+        # === Main bars update ===
+        if current_time - last_main_update_time >= main_update_interval && desired_frame_idx != last_frame_idx
+            frame_values = band_frames[desired_frame_idx]
+            peak_source_values = smoothed_frames[desired_frame_idx]
+
+            push!(ghost_history, copy(frame_values))
+            if length(ghost_history) > ghost_frames_count
+                popfirst!(ghost_history)
+            end
+
+            for j in 1:n_bands
+                if frame_values[j] > bar_display_values[j]
+                    bar_display_values[j] = frame_values[j]
+                else
+                    bar_display_values[j] *= bar_decay
+                    bar_display_values[j] = max(bar_display_values[j], frame_values[j])
+                end
+            end
+
+            bar_heights[] = clamp.(frame_values .* scale_factor, 0, y_max_display)
+
+            for j in 1:n_bands
+                if peak_source_values[j] > peak_values[j]
+                    peak_values[j] = peak_source_values[j]
+                else
+                    peak_values[j] *= peak_decay
+                    peak_values[j] = max(peak_values[j], peak_source_values[j])
+                end
+            end
+
+            rect_obs[] = [
+                Rect(j - rect_width/2, peak_values[j] - rect_height/2, rect_width, rect_height)
+                for j in 1:n_bands
+            ]
+
+            last_main_update_time = current_time
+            last_frame_idx = desired_frame_idx
+        end
+
+        # === Ghost bars update ===
+        if current_time - last_ghost_update_time >= ghost_update_interval
+            for i in 1:length(ghost_history)
+                alpha = i / ghost_frames_count
+
+                color_interp = RGB(
+                    lerp(0.5, 1.0, alpha),
+                    lerp(0.0, 0.5, alpha),
+                    lerp(0.5, 0.0, alpha)
+                )
+
+                ghost_bar_heights[i][] = clamp.(
+                    ghost_history[i] .* scale_factor .+ jitter * randn(n_bands),
+                    0,
+                    y_max_display
+                )
+                ghost_bar_plots[i].color[] = RGBA(color_interp.r, color_interp.g, color_interp.b, 0.8 * (1 - alpha^0.4))
+            end
+
+            for i in (length(ghost_history)+1):ghost_frames_count
+                ghost_bar_heights[i][] .= 0.0
+                ghost_bar_plots[i].color[] = RGBA(0.0, 0.75, 1.0, 0.0)
+            end
+
+            last_ghost_update_time = current_time
+        end
+
+        # === Frame timing and sleep ===
+        iteration_time = time() - loop_start_time
+        iteration_time_ms = iteration_time * 1000
+
+        if iteration_time_ms > 1.0
+            push!(frame_times_per_second, iteration_time_ms)
+            if length(frame_times_per_second) > max_frame_count_in_window
+                popfirst!(frame_times_per_second)
+            end
+        end
+
+        avg_frame_time = mean(frame_times_per_second)
+        max_frame_time = maximum(frame_times_per_second)
+
+        # === Progress bar update ===
+        current_time_wall = time()  # Use wall time for print timing
+        if current_time_wall - last_print_time > 0.05  # Update every 50 ms
+            progress_ratio = clamp(elapsed_sec / total_time_sec, 0.0, 1.0)
+            filled_length = round(Int, progress_ratio * progress_length)
+
+            for i in 1:progress_length
+                progress_chars[i] = (i <= filled_length) ? '█' : '░'
+            end
+            bar_str = "[" * String(progress_chars) * "]"
+
+            print("\r", bar_str, "  ",
+                @sprintf("%.1f / %.1f sec", elapsed_sec, total_time_sec),
+                "  | av ms: ", @sprintf("%.2f ms", avg_frame_time),
+                "  | max ms: ", @sprintf("%.2f ms", max_frame_time),
+                "          ")  # pad with spaces
+            flush(stdout)
+
+            last_print_time = current_time_wall
+        end
+
+        remaining_sleep = max(0.0, (1/90) - iteration_time)
+        sleep(max(0.0, remaining_sleep - 0.001))
+    end
+
+    # Final newline
+    println()
+end
+
+
+println()
+println("Closing AIMP...")
+run(`taskkill /IM AIMP.exe /F`)

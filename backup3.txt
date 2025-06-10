@@ -1,0 +1,212 @@
+println(" \n \n === Julia Music Visualizer ===")
+println("Step 1: Checking for WAV file...")
+
+ffmpeg_path = raw"C:\Program Files\FFmpeg\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe"
+mp3_path = raw"D:\Documents\_Ben Docs\School\2025 Spring\CSE310\Module 3 - Julia\Julia Proj\Birocratic - the long retreat.mp3"
+wav_path = raw"D:\Documents\_Ben Docs\School\2025 Spring\CSE310\Module 3 - Julia\Julia Proj\output.wav"
+
+if isfile(wav_path)
+    println("WAV file already exists — skipping conversion.")
+else
+    println("WAV file not found — converting MP3 to WAV...")
+    run(`$ffmpeg_path -y -i $mp3_path -ac 1 -ar 44100 $wav_path`)
+    println("MP3 converted to WAV.")
+end
+
+println("Loading Wav into memory...")
+
+using Statistics
+using Dates
+using WAV, DSP, FFTW, GLMakie, GeometryBasics, Printf
+
+# Load audio
+y, fs = wavread(wav_path)
+y = y[:,1]  # Mono
+
+println(" \n \n Loaded WAV: $(length(y)) samples at $fs Hz.")
+
+# Preprocess parameters
+frame_size = 2048
+hop_size = Int(round(fs / 60))
+win = hanning(frame_size)
+
+n_bands = 20
+fft_len = div(frame_size, 2)
+
+# Compute log-scaled band edges
+function log_spaced_band_edges(n_bands, fft_len, fs)
+    f_min = 25.0
+    f_max = 15000
+    log_edges = exp.(range(log(f_min), log(f_max), length = n_bands + 1))
+    bin_edges = clamp.(round.(Int, log_edges / (fs / fft_len)), 2, fft_len)
+    return bin_edges
+end
+
+band_edges = log_spaced_band_edges(n_bands, fft_len, fs)
+
+println("Preprocessing WAV... storing band frames at 60 FPS...")
+band_frames = []         # stores raw values → used for blue bars
+smoothed_frames = []     # stores smoothed values → used for orange rectangles
+smoothed_frame = zeros(n_bands)
+smoothing_alpha = 0.5    # feel free to tune this (0.5-0.7 is typical)
+
+for i in 1:hop_size:length(y)-frame_size
+    frame = y[i:i+frame_size-1] .* win
+    fft_result = abs.(fft(frame)[1:fft_len])
+    fft_result[1] = 0  # Zero out DC
+
+    # Apply exponential correction
+    base = 1.15
+    correction = [base^(j-1) for j in 1:n_bands]
+    correction ./= maximum(correction)
+
+    # Compute band values safely
+    band_values = [
+        isempty(fft_result[band_edges[j]:band_edges[j+1]-1]) ? 0.0 :
+        mean(fft_result[band_edges[j]:band_edges[j+1]-1])
+        for j in 1:n_bands
+    ]
+    band_values .*= correction
+
+    # Raw frame → for bars
+    raw_frame = band_values
+
+    # Smoothed frame → for peaks
+    smoothed_frame .= smoothing_alpha .* band_values .+ (1 - smoothing_alpha) .* smoothed_frame
+
+    # Push both frames
+    push!(band_frames, copy(raw_frame))
+    push!(smoothed_frames, copy(smoothed_frame))
+end
+
+println("Stored $(length(band_frames)) frames (~$(length(band_frames)/60) seconds at 60 FPS)")
+
+# Visualization setup
+println("Preparing visualization...")
+
+fig = Figure(size = (800, 400), backgroundcolor = :black)
+ax = Axis(fig[1, 1];
+    backgroundcolor = :black,
+    xgridvisible = false,
+    ygridvisible = false,
+    xticks = ([1, n_bands], ["Bass", "Treble"]),
+    leftspinevisible = false
+)
+
+fig[1, 1] = ax
+rowsize!(fig.layout, 1, Fixed(300))  # lock row height to 300 pixels
+
+# Fix View window auto sizing.
+
+# Attempt to fit things in the view window
+scale_factor = 1/3
+max_value = maximum(vcat(band_frames...))
+y_max_display = max_value * scale_factor
+ylims!(ax, 0, y_max_display * 1.1)
+
+bar_heights = Observable(zeros(n_bands))
+bars_plot = barplot!(ax, 1:n_bands, bar_heights; color=:deepskyblue)
+
+# peak_values = zeros(n_bands)
+peak_values = fill(0.05, n_bands)   # small initial height
+peak_decay = 0.95 # Fall speed of bars
+
+# Small rectangles at top of bars
+rect_width = 0.8
+rect_height = 0.1
+rect_obs = Observable([
+    Rect(j - rect_width/2, peak_values[j] - rect_height/2, rect_width, rect_height)
+    for j in 1:n_bands
+])
+rect_plot = poly!(ax, rect_obs; color = :orange)
+
+display(fig)
+
+# Launch AIMP
+AIMP_path = raw"C:\Program Files\AIMP\AIMP.exe"
+println("Launching AIMP...")
+proc = run(`$AIMP_path $mp3_path`, wait=false)
+sleep(1.525)
+
+# Playback loop — 60 FPS
+println("Starting visualization playback at 60 FPS...")
+fps_sleep = 1 / 60
+total_time_sec = length(y) / fs 
+progress_length = 40
+
+esc_pressed = Ref(false)
+on(events(fig).keyboardbutton) do event
+    if event.action == Keyboard.press && event.key == Keyboard.escape
+        println("\nESC pressed — exiting...")
+        esc_pressed[] = true
+    end
+end
+
+bar_display_values = fill(0.0, n_bands)  # tracks the bar height with smoothing
+bar_decay = 0.9  # adjust → 0.9 = medium slow fall, 0.95 = very slow
+
+target_fps = 60
+frame_interval_sec = 1 / target_fps
+
+let
+    start_time = time()  # system time in seconds
+    last_frame_idx = -1
+    elapsed_sec = 0.0  # Initialize before loop
+
+    while !esc_pressed[] && elapsed_sec < total_time_sec + 1.0
+        loop_start_time = time()
+        elapsed_sec = time() - start_time
+        desired_frame_idx = clamp(floor(Int, elapsed_sec * target_fps) + 1, 1, length(band_frames))
+
+        if desired_frame_idx != last_frame_idx && desired_frame_idx <= length(band_frames)
+            # Update visualizer to new frame
+            frame_values = band_frames[desired_frame_idx]           # raw → bars
+            peak_source_values = smoothed_frames[desired_frame_idx] # smoothed → peaks
+            
+            for j in 1:n_bands
+                if frame_values[j] > bar_display_values[j]
+                    bar_display_values[j] = frame_values[j]
+                else
+                    bar_display_values[j] *= bar_decay
+                    bar_display_values[j] = max(bar_display_values[j], frame_values[j])
+                end
+            end
+
+            # Scale factor was set earlier.
+            peak_decay_speed = 0.01 * scale_factor
+            bar_heights[] = clamp.(frame_values .* scale_factor, 0, y_max_display)
+
+            for j in 1:n_bands
+                if peak_source_values[j] > peak_values[j]
+                    peak_values[j] = peak_source_values[j]
+                else
+                    peak_values[j] *= peak_decay
+                    peak_values[j] = max(peak_values[j], peak_source_values[j])
+                end
+            end
+
+            rect_obs[] = [
+                Rect(j - rect_width/2, peak_values[j] - rect_height/2, rect_width, rect_height)
+                for j in 1:n_bands
+            ]
+
+            # Print progress bar
+            progress_ratio = clamp(elapsed_sec / total_time_sec, 0.0, 1.0)
+            filled_length = round(Int, progress_ratio * progress_length)
+            bar = "[" * repeat("=", filled_length) * repeat(" ", progress_length - filled_length) * "]"
+
+            print("\r", bar, "  ", @sprintf("%.1f / %.1f sec", elapsed_sec, total_time_sec))
+            flush(stdout)
+
+            last_frame_idx = desired_frame_idx
+        end
+
+        iteration_time = time() - loop_start_time
+        remaining_sleep = max(0.0, (1/180) - iteration_time)
+        sleep(remaining_sleep)
+    end
+end
+
+println()
+println("Closing AIMP...")
+run(`taskkill /IM AIMP.exe /F`)
