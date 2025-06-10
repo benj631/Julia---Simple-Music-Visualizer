@@ -4,6 +4,18 @@ This is a music visualizer for Julia. It loads wav files by converting them into
 
 [Here is a video demonstration of the project](https://youtu.be/-i1LnBTx5zY)
 
+Requires the following packages:
+WAV
+DSP
+FFTW
+GLMakie
+GeometryBasics
+
+Also requires:
+FFMpeg
+AIMP (or another command line launchable music player)
+
+
 # Development Environment
 
 The project uses Julia with several different packages, the biggest one being GLMakie. Other packages used include Statistics, Dates, WAV, DSP, FFTW, GLMakie, GeometryBasics, and Printf
